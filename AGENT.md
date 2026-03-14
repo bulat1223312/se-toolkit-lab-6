@@ -1,13 +1,36 @@
-# Агент для вызова LLM (Task 1)
+# Agent Documentation
 
-## Используемый LLM
-Я развернул Qwen Code API на своей ВМ с помощью прокси [qwen-code-oai-proxy](https://github.com/inno-se-toolkit/qwen-code-oai-proxy). Прокси использует учётные данные из `~/.qwen/oauth_creds.json` (полученные через Qwen Code CLI) и предоставляет OpenAI-совместимый эндпоинт. Модель — `qwen3-coder-plus`. Для доступа к API используется ключ `my-secret-qwen-key`.
+## Overview
+Agent теперь умеет читать файлы из папки `wiki` и отвечать на вопросы, ссылаясь на документацию. Для этого используются два инструмента (function calling).
 
-## Переменные окружения (файл `.env.agent.secret`)
-- `LLM_API_KEY` — ключ, заданный в `QWEN_API_KEY` при запуске прокси (в нашем случае `my-secret-qwen-key`).
-- `LLM_API_BASE` — URL прокси, например `http://<IP-ВМ>:8000/v1`.
-- `LLM_MODEL` — имя модели (`qwen3-coder-plus`, `coder-model` или `qwen3-coder-flash`).
+## Инструменты (tools)
+- **read_file(path)** – читает содержимое файла. `path` – относительный путь от корня проекта (например, `wiki/git-workflow.md`).
+- **list_files(path)** – возвращает список файлов и папок в указанной директории (например, `wiki`).
 
-## Запуск агента
-```bash
-uv run agent.py "Ваш вопрос"
+Оба инструмента защищены от выхода за пределы проекта (проверка `safe_join`).
+
+## Агентский цикл
+1. Пользователь задаёт вопрос.
+2. Системный промпт инструктирует агента использовать инструменты для поиска ответа в папке `wiki`.
+3. Цикл до 10 итераций:
+   - Запрос к LLM с описанием инструментов.
+   - Если LLM вызывает инструменты – они выполняются, результаты возвращаются в историю.
+   - Если LLM даёт текстовый ответ – из него извлекается строка `Source: ...` (указывает на файл и секцию) и возвращается финальный JSON.
+4. Если за 10 итераций ответ не получен, возвращается последнее сообщение ассистента.
+
+## Формат вывода
+Всегда JSON с полями:
+- `answer` (string) – ответ на вопрос (без строки Source).
+- `source` (string) – ссылка на wiki-файл и секцию (например, `wiki/git-workflow.md#resolving-merge-conflicts`).
+- `tool_calls` (array) – список всех выполненных вызовов инструментов. Каждый элемент содержит `tool`, `args`, `result`.
+
+Пример:
+```json
+{
+  "answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.",
+  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+  "tool_calls": [
+    {"tool": "list_files", "args": {"path": "wiki"}, "result": "git-workflow.md\n..."},
+    {"tool": "read_file", "args": {"path": "wiki/git-workflow.md"}, "result": "..."}
+  ]
+}
