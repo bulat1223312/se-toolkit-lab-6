@@ -2,16 +2,19 @@
 import os
 import sys
 import json
+import requests
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Загружаем переменные из .env.agent.secret
+# Загружаем переменные окружения из .env.agent.secret (LLM) и .env.docker.secret (LMS)
 load_dotenv(".env.agent.secret")
+load_dotenv(".env.docker.secret")
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def safe_join(base, *paths):
+    """Обеспечивает безопасное объединение путей, не позволяя выйти за пределы PROJECT_ROOT."""
     abs_path = os.path.abspath(os.path.join(base, *paths))
     if os.path.commonpath([abs_path, base]) != base:
         raise ValueError("Access denied: path outside project directory")
@@ -19,6 +22,7 @@ def safe_join(base, *paths):
 
 
 def read_file(path):
+    """Читает содержимое файла внутри проекта."""
     try:
         full_path = safe_join(PROJECT_ROOT, path)
         with open(full_path, 'r', encoding='utf-8') as f:
@@ -28,6 +32,7 @@ def read_file(path):
 
 
 def list_files(path):
+    """Возвращает список файлов в указанной директории внутри проекта."""
     try:
         full_path = safe_join(PROJECT_ROOT, path)
         entries = os.listdir(full_path)
@@ -36,18 +41,50 @@ def list_files(path):
         return f"Error listing directory: {e}"
 
 
+def query_api(method: str, path: str, body: str = None) -> str:
+    """
+    Выполняет HTTP-запрос к развёрнутому бэкенду.
+    Возвращает JSON-строку с полями status_code и body.
+    """
+    base_url = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
+    api_key = os.getenv("LMS_API_KEY")
+
+    if not api_key:
+        return json.dumps({"status_code": 500, "body": "LMS_API_KEY not set"})
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    # Убираем лишние слеши
+    url = base_url.rstrip('/') + '/' + path.lstrip('/')
+    try:
+        json_body = json.loads(body) if body else None
+        response = requests.request(
+            method=method.upper(),
+            url=url,
+            headers=headers,
+            json=json_body,
+            timeout=10
+        )
+        return json.dumps({
+            "status_code": response.status_code,
+            "body": response.text
+        })
+    except Exception as e:
+        return json.dumps({"status_code": 500, "body": str(e)})
+
+
+# Схемы инструментов для OpenAI function calling
 tools = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file from the project wiki",
+            "description": "Read the contents of a file from the project (source code, wiki, configs).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from project root (e.g., wiki/git-workflow.md)"
+                        "description": "Relative path from project root (e.g., wiki/git-workflow.md, backend/main.py)"
                     }
                 },
                 "required": ["path"]
@@ -58,16 +95,42 @@ tools = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories in a given path",
+            "description": "List files and directories in a given path.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative directory path from project root (e.g., wiki)"
+                        "description": "Relative directory path from project root (e.g., wiki, backend)"
                     }
                 },
                 "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call the running backend API. Use for dynamic data (item count, scores), status codes, or error reproduction.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "PUT", "DELETE"],
+                        "description": "HTTP method"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API path, e.g., '/items/' or '/analytics/completion-rate?lab=lab-99'"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body as a string (for POST/PUT)"
+                    }
+                },
+                "required": ["method", "path"]
             }
         }
     }
@@ -81,7 +144,7 @@ def run_agent(question, client, model, system_prompt):
     ]
     all_tool_calls = []
 
-    for _ in range(10):
+    for _ in range(10):  # максимум 10 итераций
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -105,10 +168,17 @@ def run_agent(question, client, model, system_prompt):
                 except json.JSONDecodeError:
                     args = {}
 
+                # Выполняем нужную функцию
                 if func_name == "read_file":
                     result = read_file(args.get("path", ""))
                 elif func_name == "list_files":
                     result = list_files(args.get("path", ""))
+                elif func_name == "query_api":
+                    # Извлекаем параметры с учётом optional body
+                    method = args.get("method", "GET")
+                    path = args.get("path", "")
+                    body = args.get("body")
+                    result = query_api(method, path, body)
                 else:
                     result = f"Unknown tool: {func_name}"
 
@@ -123,12 +193,15 @@ def run_agent(question, client, model, system_prompt):
                     "tool_call_id": tool_call.id,
                     "content": result
                 })
-            continue
+            continue  # после обработки tool_calls запрашиваем следующий ответ LLM
 
+        # Достигнут финальный ответ (без tool_calls)
         final_text = message.content or ""
+
+        # Ищем строку Source: в конце (для вики-вопросов). Если нет – source останется пустым.
         source = ""
         lines = final_text.split("\n")
-        for i in range(len(lines)-1, -1, -1):
+        for i in range(len(lines) - 1, -1, -1):
             stripped = lines[i].strip()
             if stripped.startswith("Source:"):
                 source = stripped[7:].strip()
@@ -142,6 +215,7 @@ def run_agent(question, client, model, system_prompt):
             "tool_calls": all_tool_calls
         }
 
+    # Если цикл завершился без возврата (слишком много итераций)
     last_message = messages[-1] if messages else None
     if last_message and last_message.get("role") == "assistant":
         return {
@@ -160,26 +234,35 @@ def main():
 
     question = sys.argv[1]
 
-    api_key = os.getenv("LLM_API_KEY")
-    base_url = os.getenv("LLM_API_BASE")
-    model = os.getenv("LLM_MODEL")
+    # Чтение обязательных переменных для LLM
+    llm_api_key = os.getenv("LLM_API_KEY")
+    llm_api_base = os.getenv("LLM_API_BASE")
+    llm_model = os.getenv("LLM_MODEL")
 
-    if not all([api_key, base_url, model]):
+    if not all([llm_api_key, llm_api_base, llm_model]):
         print("Ошибка: не заданы LLM_API_KEY, LLM_API_BASE или LLM_MODEL", file=sys.stderr)
         sys.exit(1)
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    # Переменные для query_api (AGENT_API_BASE_URL опциональна, LMS_API_KEY проверяется в функции)
+    # При локальной разработке они должны быть загружены из .env.docker.secret
 
+    client = OpenAI(api_key=llm_api_key, base_url=llm_api_base)
+
+    # Обновлённый системный промпт с чёткими правилами выбора инструментов
     system_prompt = (
-        "You are an assistant that answers questions about the project documentation. "
-        "You have two tools: read_file (to read a file) and list_files (to list directory contents). "
-        "Use them to find the answer in the 'wiki' folder. "
-        "First explore the folder structure with list_files('wiki'), then read relevant files. "
-        "After you find the answer, always append a line at the very end in the format: "
-        "'Source: <file_path>#<section_anchor>', for example 'Source: wiki/git-workflow.md#resolving-merge-conflicts'."
+        "You are an assistant that helps developers understand a project. "
+        "You have three tools: read_file, list_files, and query_api.\n"
+        "- Use read_file/list_files for questions about the codebase, configuration, wiki (e.g., 'what framework', 'how to protect a branch').\n"
+        "- Use query_api for questions about dynamic data (e.g., 'how many items', 'status code without auth') and to reproduce API errors.\n"
+        "- If an API call returns an error, you may need to read the corresponding source code to diagnose the bug: first call query_api, then read_file on the relevant file.\n"
+        "After you find the answer (from files), always append a line at the very end in the format: "
+        "'Source: <file_path>#<section_anchor>' (for wiki questions). For system questions, you do not need to add a Source line.\n"
+        "Answer concisely and include the requested information."
     )
 
-    result = run_agent(question, client, model, system_prompt)
+    result = run_agent(question, client, llm_model, system_prompt)
+
+    # Выводим результат в JSON (ensure_ascii=False для поддержки русского языка)
     print(json.dumps(result, ensure_ascii=False))
 
     if "error" in result:
