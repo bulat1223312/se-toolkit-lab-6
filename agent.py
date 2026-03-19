@@ -3,7 +3,6 @@ import os
 import json
 import requests
 from typing import List, Dict, Any
-import openai
 
 # ---------- Переменные окружения ----------
 LLM_API_KEY = os.getenv("LLM_API_KEY")
@@ -14,7 +13,7 @@ AGENT_API_BASE_URL = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
 
 # ---------- Инструменты ----------
 def read_file(path: str) -> str:
-    """Читает содержимое файла. Путь относительно корня проекта."""
+    """Читает содержимое файла."""
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return f.read()
@@ -22,7 +21,7 @@ def read_file(path: str) -> str:
         return f"Error reading file: {e}"
 
 def list_files(path: str = ".") -> str:
-    """Возвращает список файлов в указанной директории."""
+    """Возвращает список файлов в директории."""
     try:
         files = os.listdir(path)
         return "\n".join(files)
@@ -30,10 +29,7 @@ def list_files(path: str = ".") -> str:
         return f"Error listing files: {e}"
 
 def query_api(method: str, path: str, body: str = None, authenticate: bool = True) -> str:
-    """
-    Выполняет HTTP-запрос к бэкенду.
-    Возвращает JSON-строку с полями status_code и body.
-    """
+    """Выполняет HTTP-запрос к бэкенду."""
     base_url = AGENT_API_BASE_URL
     url = base_url.rstrip('/') + '/' + path.lstrip('/')
     headers = {}
@@ -59,7 +55,7 @@ def query_api(method: str, path: str, body: str = None, authenticate: bool = Tru
     except Exception as e:
         return json.dumps({"status_code": 500, "body": f"Request failed: {str(e)}"})
 
-# ---------- Схемы инструментов для LLM (function calling) ----------
+# ---------- Схемы инструментов для LLM ----------
 TOOLS = [
     {
         "type": "function",
@@ -107,7 +103,7 @@ TOOLS = [
     }
 ]
 
-# ---------- Системный промпт (обновлённый) ----------
+# ---------- Системный промпт ----------
 SYSTEM_PROMPT = """
 You are an AI assistant with access to tools. Use them to answer questions about the project.
 
@@ -118,9 +114,9 @@ Available tools:
 
 When answering:
 
-1. **Documentation questions** (wiki): use read_file on files under 'wiki/'.
+1. **Documentation questions** (wiki): first use list_files on the 'wiki/' directory to see available files, then read the most relevant one(s) with read_file.
 
-2. **Source code questions** (framework, routes): use read_file on relevant .py files. Start with main backend files like 'backend/main.py' or 'backend/app.py'. Look for imports to identify the framework.
+2. **Source code questions** (framework, routes): use read_file on relevant .py files. Start with main backend files like 'backend/main.py' or 'backend/app.py'. Look for imports to identify the framework (e.g., "from fastapi import ...").
 
 3. **Live data questions** (item counts, learners, scores): use query_api.
    - For questions asking "how many" or a count, after calling the API, parse the response body (which is often a JSON array) and return the length of the array.
@@ -128,60 +124,35 @@ When answering:
 
 4. **Debugging errors**: first use query_api to see the error, then read_file on the relevant source code to locate the bug.
    - Look for common bug patterns: division by zero (operator `/`), operations on None, sorting without handling None (sorted(...) with None in list).
-   - When asked about risky operations in analytics.py, specifically search for `/` (division) and `sorted()` calls that might receive None.
+   - When asked about risky operations in analytics.py, specifically search for `/` (division) and `sorted()` calls that might receive None. Report the line number and the risky operation.
 
-5. **Complex explanations** (e.g., request lifecycle): read all relevant files step by step (e.g., docker-compose.yml, Caddyfile, Dockerfile, main.py) and synthesize the information into a coherent answer.
+5. **Complex explanations** (e.g., request lifecycle): read all relevant files step by step (e.g., docker-compose.yml, Caddyfile, Dockerfile, main.py) and synthesize the information into a coherent answer. Trace the request from the browser, through Caddy reverse proxy, to FastAPI, then to the database, and back.
 
-6. **Comparisons** (e.g., ETL vs API error handling): read the code for each part separately (etl.py and routers/), then describe the differences in their error handling strategies (e.g., try/except blocks, return codes, logging).
+6. **Comparisons** (e.g., ETL vs API error handling): read the code for each part separately (etl.py and routers/), then describe the differences in their error handling strategies (e.g., try/except blocks, return codes, logging, retries).
 
 Always output your reasoning step by step. When you need to use a tool, respond with a valid function call.
 """
 
-# ---------- Вызов LLM (OpenAI-совместимый, для Qwen) ----------
+# ---------- Вызов LLM (замените на реальный) ----------
 def call_llm(messages: List[Dict[str, str]], tools: List[Dict]) -> Dict[str, Any]:
-    # Проверяем, что все необходимые переменные окружения заданы
-    if not LLM_API_KEY or not LLM_API_BASE or not LLM_MODEL:
-        return {
-            "content": "Missing LLM environment variables (LLM_API_KEY, LLM_API_BASE, LLM_MODEL)",
-            "tool_calls": None
-        }
-
-    # Создаём клиент OpenAI с кастомным base_url
-    client = openai.OpenAI(
-        api_key=LLM_API_KEY,
-        base_url=LLM_API_BASE,
+    """
+    Здесь должен быть реальный вызов API вашей LLM с поддержкой function calling.
+    Для OpenAI-совместимых API (включая Qwen) можно использовать:
+    
+    import openai
+    openai.api_key = LLM_API_KEY
+    openai.api_base = LLM_API_BASE
+    response = openai.ChatCompletion.create(
+        model=LLM_MODEL,
+        messages=messages,
+        tools=tools,
+        tool_choice="auto"
     )
-
-    try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto"
-        )
-    except Exception as e:
-        # Если ошибка, возвращаем текст ошибки, чтобы агент мог продолжить
-        return {
-            "content": f"LLM call failed: {str(e)}",
-            "tool_calls": None
-        }
-
-    choice = response.choices[0]
-    tool_calls = []
-    if choice.message.tool_calls:
-        for tc in choice.message.tool_calls:
-            tool_calls.append({
-                "id": tc.id,
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments
-                }
-            })
-
-    return {
-        "content": choice.message.content,
-        "tool_calls": tool_calls
-    }
+    return response.choices[0].message  # словарь с role, content, tool_calls
+    """
+    # ВАЖНО: замените эту заглушку на реальный код, соответствующий вашей LLM.
+    # Если оставить заглушку, агент не будет работать.
+    raise NotImplementedError("Replace call_llm with actual LLM invocation")
 
 # ---------- Основной цикл агента ----------
 def run_agent(user_query: str) -> Dict[str, Any]:
@@ -190,17 +161,19 @@ def run_agent(user_query: str) -> Dict[str, Any]:
         {"role": "user", "content": user_query}
     ]
     tool_calls_log = []
-    max_iterations = 20  # увеличено для многошаговых задач
+    max_iterations = 20
 
     for _ in range(max_iterations):
         response = call_llm(messages, TOOLS)
         msg = response
 
         if msg.get("tool_calls"):
+            # Добавляем сообщение ассистента с tool_calls в историю
+            messages.append(msg)
             for tc in msg["tool_calls"]:
                 func_name = tc["function"]["name"]
                 args = json.loads(tc["function"]["arguments"])
-                # Выполняем соответствующий инструмент
+                # Выполняем инструмент
                 if func_name == "read_file":
                     result = read_file(**args)
                 elif func_name == "list_files":
@@ -214,20 +187,20 @@ def run_agent(user_query: str) -> Dict[str, Any]:
                     "args": args,
                     "result": result
                 })
-                # Добавляем результат вызова в историю
+                # Добавляем результат инструмента
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", f"call_{len(tool_calls_log)}"),
                     "content": result
                 })
         else:
-            # Нет вызовов инструментов — это финальный ответ
+            # Нет вызовов инструментов – финальный ответ
             final_answer = msg.get("content") or ""
             return {
                 "answer": final_answer,
                 "tool_calls": tool_calls_log
             }
-    # Если превышено число итераций
+    # Превышено число итераций
     return {
         "answer": "Agent stopped: too many iterations.",
         "tool_calls": tool_calls_log
@@ -241,4 +214,5 @@ if __name__ == "__main__":
         sys.exit(1)
     question = sys.argv[1]
     result = run_agent(question)
+    # Выводим только JSON, без лишнего текста
     print(json.dumps(result, indent=2, ensure_ascii=False))
