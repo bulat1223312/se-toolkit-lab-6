@@ -13,9 +13,10 @@ LLM_MODEL = os.getenv("LLM_MODEL")
 LMS_API_KEY = os.getenv("LMS_API_KEY")
 AGENT_API_BASE_URL = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
 
-# Проверка наличия обязательных переменных для LLM (необязательно для запуска, но для отладки)
+# Проверка наличия обязательных переменных для LLM (не fatal, но для отладки)
 if not all([LLM_API_KEY, LLM_API_BASE, LLM_MODEL]):
-    print(json.dumps({"error": "Missing LLM environment variables (LLM_API_KEY, LLM_API_BASE, LLM_MODEL)"}), file=sys.stderr)
+    # Если нет ключей, выводим JSON с ошибкой и выходим
+    print(json.dumps({"error": "Missing LLM environment variables (LLM_API_KEY, LLM_API_BASE, LLM_MODEL)"}))
     sys.exit(1)
 
 # ---------- Инструменты ----------
@@ -50,15 +51,15 @@ def query_api(method: str, path: str, body: str = None, authenticate: bool = Tru
     try:
         method = method.upper()
         if method == "GET":
-            resp = requests.get(url, headers=headers)
+            resp = requests.get(url, headers=headers, timeout=10)
         elif method == "POST":
             data = json.loads(body) if body else None
-            resp = requests.post(url, headers=headers, json=data)
+            resp = requests.post(url, headers=headers, json=data, timeout=10)
         elif method == "PUT":
             data = json.loads(body) if body else None
-            resp = requests.put(url, headers=headers, json=data)
+            resp = requests.put(url, headers=headers, json=data, timeout=10)
         elif method == "DELETE":
-            resp = requests.delete(url, headers=headers)
+            resp = requests.delete(url, headers=headers, timeout=10)
         else:
             return json.dumps({"status_code": 400, "body": "Unsupported method"})
         return json.dumps({"status_code": resp.status_code, "body": resp.text})
@@ -143,10 +144,10 @@ When answering:
 Always output your reasoning step by step. When you need to use a tool, respond with a valid function call.
 """
 
-# ---------- Вызов LLM (OpenAI) ----------
+# ---------- Вызов LLM (OpenAI-совместимый, например Qwen) ----------
 def call_llm(messages: List[Dict[str, str]], tools: List[Dict]) -> Dict[str, Any]:
     """
-    Реальный вызов OpenAI API с поддержкой function calling.
+    Реальный вызов OpenAI-совместимого API (подходит для Qwen).
     """
     try:
         # Настройка клиента (старый стиль openai<1.0.0, но многие ещё используют)
@@ -225,12 +226,17 @@ def run_agent(user_query: str) -> Dict[str, Any]:
         "tool_calls": tool_calls_log
     }
 
-# ---------- Точка входа ----------
+# ---------- Точка входа с гарантированным JSON-выводом ----------
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: uv run agent.py 'your question'")
+    try:
+        if len(sys.argv) < 2:
+            print(json.dumps({"error": "Usage: uv run agent.py 'your question'"}))
+            sys.exit(1)
+        question = sys.argv[1]
+        result = run_agent(question)
+        # Печатаем только JSON, без лишних логов
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    except Exception as e:
+        # Любое непредвиденное исключение перехватываем и выводим JSON с ошибкой
+        print(json.dumps({"error": f"Unhandled exception: {str(e)}"}))
         sys.exit(1)
-    question = sys.argv[1]
-    result = run_agent(question)
-    # Печатаем только JSON, без лишних логов
-    print(json.dumps(result, indent=2, ensure_ascii=False))
