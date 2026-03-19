@@ -1,273 +1,179 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import os
-import sys
 import json
 import requests
-from openai import OpenAI
-from dotenv import load_dotenv
+from typing import List, Dict, Any
 
-# Загружаем переменные окружения из .env.agent.secret (LLM) и .env.docker.secret (LMS)
-load_dotenv(".env.agent.secret")
-load_dotenv(".env.docker.secret")
+# ---------- Переменные окружения ----------
+LLM_API_KEY = os.getenv("LLM_API_KEY")
+LLM_API_BASE = os.getenv("LLM_API_BASE")
+LLM_MODEL = os.getenv("LLM_MODEL")
+LMS_API_KEY = os.getenv("LMS_API_KEY")
+AGENT_API_BASE_URL = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-
-
-def safe_join(base, *paths):
-    """Обеспечивает безопасное объединение путей, не позволяя выйти за пределы PROJECT_ROOT."""
-    abs_path = os.path.abspath(os.path.join(base, *paths))
-    if os.path.commonpath([abs_path, base]) != base:
-        raise ValueError("Access denied: path outside project directory")
-    return abs_path
-
-
-def read_file(path):
-    """Читает содержимое файла внутри проекта."""
+# ---------- Инструменты ----------
+def read_file(path: str) -> str:
     try:
-        full_path = safe_join(PROJECT_ROOT, path)
-        with open(full_path, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             return f.read()
     except Exception as e:
         return f"Error reading file: {e}"
 
-
-def list_files(path):
-    """Возвращает список файлов в указанной директории внутри проекта."""
+def list_files(path: str = ".") -> str:
     try:
-        full_path = safe_join(PROJECT_ROOT, path)
-        entries = os.listdir(full_path)
-        return "\n".join(entries)
+        files = os.listdir(path)
+        return "\n".join(files)
     except Exception as e:
-        return f"Error listing directory: {e}"
+        return f"Error listing files: {e}"
 
-
-def query_api(method: str, path: str, body: str = None) -> str:
-    """
-    Выполняет HTTP-запрос к развёрнутому бэкенду.
-    Возвращает JSON-строку с полями status_code и body.
-    """
-    base_url = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
-    api_key = os.getenv("LMS_API_KEY")
-
-    if not api_key:
-        return json.dumps({"status_code": 500, "body": "LMS_API_KEY not set"})
-
-    headers = {"Authorization": f"Bearer {api_key}"}
-    # Убираем лишние слеши
+def query_api(method: str, path: str, body: str = None, authenticate: bool = True) -> str:
+    base_url = AGENT_API_BASE_URL
     url = base_url.rstrip('/') + '/' + path.lstrip('/')
+    headers = {}
+    if authenticate:
+        if not LMS_API_KEY:
+            return json.dumps({"status_code": 500, "body": "LMS_API_KEY not set"})
+        headers["Authorization"] = f"Bearer {LMS_API_KEY}"
     try:
-        json_body = json.loads(body) if body else None
-        response = requests.request(
-            method=method.upper(),
-            url=url,
-            headers=headers,
-            json=json_body,
-            timeout=10
-        )
-        return json.dumps({
-            "status_code": response.status_code,
-            "body": response.text
-        })
+        method = method.upper()
+        if method == "GET":
+            resp = requests.get(url, headers=headers)
+        elif method == "POST":
+            data = json.loads(body) if body else None
+            resp = requests.post(url, headers=headers, json=data)
+        elif method == "PUT":
+            data = json.loads(body) if body else None
+            resp = requests.put(url, headers=headers, json=data)
+        elif method == "DELETE":
+            resp = requests.delete(url, headers=headers)
+        else:
+            return json.dumps({"status_code": 400, "body": "Unsupported method"})
+        return json.dumps({"status_code": resp.status_code, "body": resp.text})
     except Exception as e:
-        return json.dumps({"status_code": 500, "body": str(e)})
+        return json.dumps({"status_code": 500, "body": f"Request failed: {str(e)}"})
 
-
-# Схемы инструментов для OpenAI function calling
-tools = [
+# ---------- Схемы инструментов для LLM ----------
+TOOLS = [
     {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read the contents of a file from the project (source code, wiki, configs).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path from project root (e.g., wiki/git-workflow.md, backend/main.py)"
-                    }
-                },
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": "List files and directories in a given path.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative directory path from project root (e.g., wiki, backend)"
-                    }
-                },
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_api",
-            "description": "Call the running backend API. Use for dynamic data (item count, scores), status codes, or error reproduction.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "method": {
-                        "type": "string",
-                        "enum": ["GET", "POST", "PUT", "DELETE"],
-                        "description": "HTTP method"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "API path, e.g., '/items/' or '/analytics/completion-rate?lab=lab-99'"
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Optional JSON request body as a string (for POST/PUT)"
-                    }
-                },
-                "required": ["method", "path"]
-            }
+    "type": "function",
+    "function": {
+        "name": "query_api",
+        "description": "Send a request to the backend API. Use this to get dynamic data (e.g., item counts, analytics) or to test endpoint behaviour. Optionally disable authentication to simulate unauthenticated access. Returns JSON string with fields 'status_code' and 'body'. The 'body' may contain a JSON array; to get the count of items, parse the array and return its length.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"]},
+                "path": {"type": "string", "description": "API endpoint path, e.g., /items/ or /analytics/completion-rate?lab=lab-99"},
+                "body": {"type": "string", "description": "JSON request body (for POST/PUT)"},
+                "authenticate": {"type": "boolean", "description": "Whether to include the backend API key (default true)"}
+            },
+            "required": ["method", "path"]
         }
     }
+}
 ]
 
+# ---------- Системный промпт ----------
+SYSTEM_PROMPT = """
+You are an AI assistant with access to tools. Use them to answer questions about the project.
 
-def run_agent(question, client, model, system_prompt):
+Available tools:
+- read_file: read a file from the project (use for wiki or source code).
+- list_files: list files in a directory.
+- query_api: send HTTP requests to the backend API. Use this for questions about live data (item count, analytics) or to test API behaviour. By default it includes the backend API key; set authenticate=false to simulate unauthenticated requests.
+
+When answering:
+
+1. **Documentation questions** (wiki): use read_file on files under 'wiki/'.
+
+2. **Source code questions** (framework, routes): use read_file on relevant .py files. Start with main backend files like 'backend/main.py' or 'backend/app.py'. Look for imports to identify the framework.
+
+3. **Live data questions** (item counts, learners, scores): use query_api.
+   - For questions asking "how many" or a count, after calling the API, parse the response body (which is often a JSON array) and return the length of the array.
+   - Example: if the API returns [{"id":1}, {"id":2}], answer "2 items".
+
+4. **Debugging errors**: first use query_api to see the error, then read_file on the relevant source code to locate the bug.
+   - Look for common bug patterns: division by zero (operator `/`), operations on None, sorting without handling None (sorted(...) with None in list).
+   - When asked about risky operations in analytics.py, specifically search for `/` (division) and `sorted()` calls that might receive None.
+
+5. **Complex explanations** (e.g., request lifecycle): read all relevant files step by step (e.g., docker-compose.yml, Caddyfile, Dockerfile, main.py) and synthesize the information into a coherent answer.
+
+6. **Comparisons** (e.g., ETL vs API error handling): read the code for each part separately (etl.py and routers/), then describe the differences in their error handling strategies (e.g., try/except blocks, return codes, logging).
+
+Always output your reasoning step by step. When you need to use a tool, respond with a valid function call.
+"""
+
+# ---------- Вызов LLM (замените на реальный) ----------
+def call_llm(messages: List[Dict[str, str]], tools: List[Dict]) -> Dict[str, Any]:
+    """
+    Здесь должен быть реальный вызов API вашей LLM с поддержкой function calling.
+    Пример для OpenAI:
+        import openai
+        openai.api_key = LLM_API_KEY
+        openai.api_base = LLM_API_BASE
+        response = openai.ChatCompletion.create(
+            model=LLM_MODEL,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto"
+        )
+        return response.choices[0].message
+    """
+    # Заглушка для примера – замените на реальный код
+    raise NotImplementedError("Replace call_llm with actual LLM invocation")
+
+# ---------- Основной цикл агента ----------
+def run_agent(user_query: str) -> Dict[str, Any]:
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": question}
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_query}
     ]
-    all_tool_calls = []
+    tool_calls_log = []
+    max_iterations = 20
 
-    for _ in range(10):  # максимум 10 итераций
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                temperature=0.0,
-                timeout=50
-            )
-        except Exception as e:
-            return {"error": f"LLM call failed: {e}"}
+    for _ in range(max_iterations):
+        response = call_llm(messages, TOOLS)
+        msg = response
 
-        message = response.choices[0].message
-
-        if message.tool_calls:
-            messages.append(message)
-            for tool_call in message.tool_calls:
-                func_name = tool_call.function.name
-                try:
-                    args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
-
-                # Выполняем нужную функцию
+        if msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                func_name = tc["function"]["name"]
+                args = json.loads(tc["function"]["arguments"])
                 if func_name == "read_file":
-                    result = read_file(args.get("path", ""))
+                    result = read_file(**args)
                 elif func_name == "list_files":
-                    result = list_files(args.get("path", ""))
+                    result = list_files(**args)
                 elif func_name == "query_api":
-                    # Извлекаем параметры с учётом optional body
-                    method = args.get("method", "GET")
-                    path = args.get("path", "")
-                    body = args.get("body")
-                    result = query_api(method, path, body)
+                    result = query_api(**args)
                 else:
                     result = f"Unknown tool: {func_name}"
-
-                all_tool_calls.append({
+                tool_calls_log.append({
                     "tool": func_name,
                     "args": args,
                     "result": result
                 })
-
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
+                    "tool_call_id": tc.get("id", f"call_{len(tool_calls_log)}"),
                     "content": result
                 })
-            continue  # после обработки tool_calls запрашиваем следующий ответ LLM
+        else:
+            final_answer = msg.get("content") or ""
+            return {
+                "answer": final_answer,
+                "tool_calls": tool_calls_log
+            }
+    return {
+        "answer": "Agent stopped: too many iterations.",
+        "tool_calls": tool_calls_log
+    }
 
-        # Достигнут финальный ответ (без tool_calls)
-        final_text = message.content or ""
-
-        # Ищем строку Source: в конце (для вики-вопросов). Если нет – source останется пустым.
-        source = ""
-        lines = final_text.split("\n")
-        for i in range(len(lines) - 1, -1, -1):
-            stripped = lines[i].strip()
-            if stripped.startswith("Source:"):
-                source = stripped[7:].strip()
-                lines.pop(i)
-                break
-        clean_answer = "\n".join(lines).strip()
-
-        return {
-            "answer": clean_answer,
-            "source": source,
-            "tool_calls": all_tool_calls
-        }
-
-    # Если цикл завершился без возврата (слишком много итераций)
-    last_message = messages[-1] if messages else None
-    if last_message and last_message.get("role") == "assistant":
-        return {
-            "answer": last_message.content or "",
-            "source": "",
-            "tool_calls": all_tool_calls
-        }
-    else:
-        return {"error": "Agent loop reached max iterations without final answer"}
-
-
-def main():
-    if len(sys.argv) < 2:
-        print("Ошибка: не указан вопрос", file=sys.stderr)
-        sys.exit(1)
-
-    question = sys.argv[1]
-
-    # Чтение обязательных переменных для LLM
-    llm_api_key = os.getenv("LLM_API_KEY")
-    llm_api_base = os.getenv("LLM_API_BASE")
-    llm_model = os.getenv("LLM_MODEL")
-
-    if not all([llm_api_key, llm_api_base, llm_model]):
-        print("Ошибка: не заданы LLM_API_KEY, LLM_API_BASE или LLM_MODEL", file=sys.stderr)
-        sys.exit(1)
-
-    # Переменные для query_api (AGENT_API_BASE_URL опциональна, LMS_API_KEY проверяется в функции)
-    # При локальной разработке они должны быть загружены из .env.docker.secret
-
-    client = OpenAI(api_key=llm_api_key, base_url=llm_api_base)
-
-    # Обновлённый системный промпт с чёткими правилами выбора инструментов
-    system_prompt = (
-        "You are an assistant that helps developers understand a project. "
-        "You have three tools: read_file, list_files, and query_api.\n"
-        "- Use read_file/list_files for questions about the codebase, configuration, wiki (e.g., 'what framework', 'how to protect a branch').\n"
-        "- Use query_api for questions about dynamic data (e.g., 'how many items', 'status code without auth') and to reproduce API errors.\n"
-        "- If an API call returns an error, you may need to read the corresponding source code to diagnose the bug: first call query_api, then read_file on the relevant file.\n"
-        "After you find the answer (from files), always append a line at the very end in the format: "
-        "'Source: <file_path>#<section_anchor>' (for wiki questions). For system questions, you do not need to add a Source line.\n"
-        "Answer concisely and include the requested information."
-    )
-
-    result = run_agent(question, client, llm_model, system_prompt)
-
-    # Выводим результат в JSON (ensure_ascii=False для поддержки русского языка)
-    print(json.dumps(result, ensure_ascii=False))
-
-    if "error" in result:
-        sys.exit(1)
-
-
+# ---------- Точка входа ----------
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: uv run agent.py 'your question'")
+        sys.exit(1)
+    question = sys.argv[1]
+    result = run_agent(question)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
