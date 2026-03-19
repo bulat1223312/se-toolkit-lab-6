@@ -3,6 +3,7 @@ import os
 import json
 import requests
 from typing import List, Dict, Any
+import openai
 
 # ---------- Переменные окружения ----------
 LLM_API_KEY = os.getenv("LLM_API_KEY")
@@ -13,6 +14,7 @@ AGENT_API_BASE_URL = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
 
 # ---------- Инструменты ----------
 def read_file(path: str) -> str:
+    """Читает содержимое файла. Путь относительно корня проекта."""
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return f.read()
@@ -20,6 +22,7 @@ def read_file(path: str) -> str:
         return f"Error reading file: {e}"
 
 def list_files(path: str = ".") -> str:
+    """Возвращает список файлов в указанной директории."""
     try:
         files = os.listdir(path)
         return "\n".join(files)
@@ -27,6 +30,10 @@ def list_files(path: str = ".") -> str:
         return f"Error listing files: {e}"
 
 def query_api(method: str, path: str, body: str = None, authenticate: bool = True) -> str:
+    """
+    Выполняет HTTP-запрос к бэкенду.
+    Возвращает JSON-строку с полями status_code и body.
+    """
     base_url = AGENT_API_BASE_URL
     url = base_url.rstrip('/') + '/' + path.lstrip('/')
     headers = {}
@@ -52,28 +59,55 @@ def query_api(method: str, path: str, body: str = None, authenticate: bool = Tru
     except Exception as e:
         return json.dumps({"status_code": 500, "body": f"Request failed: {str(e)}"})
 
-# ---------- Схемы инструментов для LLM ----------
+# ---------- Схемы инструментов для LLM (function calling) ----------
 TOOLS = [
     {
-    "type": "function",
-    "function": {
-        "name": "query_api",
-        "description": "Send a request to the backend API. Use this to get dynamic data (e.g., item counts, analytics) or to test endpoint behaviour. Optionally disable authentication to simulate unauthenticated access. Returns JSON string with fields 'status_code' and 'body'. The 'body' may contain a JSON array; to get the count of items, parse the array and return its length.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"]},
-                "path": {"type": "string", "description": "API endpoint path, e.g., /items/ or /analytics/completion-rate?lab=lab-99"},
-                "body": {"type": "string", "description": "JSON request body (for POST/PUT)"},
-                "authenticate": {"type": "boolean", "description": "Whether to include the backend API key (default true)"}
-            },
-            "required": ["method", "path"]
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file. Use this to access wiki documentation or source code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file relative to project root"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files in a directory. Use this to explore the project structure.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path (default: current directory)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Send a request to the backend API. Use this to get dynamic data (e.g., item counts, analytics) or to test endpoint behaviour. Optionally disable authentication to simulate unauthenticated access. Returns JSON string with fields 'status_code' and 'body'. The 'body' may contain a JSON array; to get the count of items, parse the array and return its length.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"]},
+                    "path": {"type": "string", "description": "API endpoint path, e.g., /items/ or /analytics/completion-rate?lab=lab-99"},
+                    "body": {"type": "string", "description": "JSON request body (for POST/PUT)"},
+                    "authenticate": {"type": "boolean", "description": "Whether to include the backend API key (default true)"}
+                },
+                "required": ["method", "path"]
+            }
         }
     }
-}
 ]
 
-# ---------- Системный промпт ----------
+# ---------- Системный промпт (обновлённый) ----------
 SYSTEM_PROMPT = """
 You are an AI assistant with access to tools. Use them to answer questions about the project.
 
@@ -103,24 +137,51 @@ When answering:
 Always output your reasoning step by step. When you need to use a tool, respond with a valid function call.
 """
 
-# ---------- Вызов LLM (замените на реальный) ----------
+# ---------- Вызов LLM (OpenAI-совместимый, для Qwen) ----------
 def call_llm(messages: List[Dict[str, str]], tools: List[Dict]) -> Dict[str, Any]:
-    """
-    Здесь должен быть реальный вызов API вашей LLM с поддержкой function calling.
-    Пример для OpenAI:
-        import openai
-        openai.api_key = LLM_API_KEY
-        openai.api_base = LLM_API_BASE
-        response = openai.ChatCompletion.create(
+    # Проверяем, что все необходимые переменные окружения заданы
+    if not LLM_API_KEY or not LLM_API_BASE or not LLM_MODEL:
+        return {
+            "content": "Missing LLM environment variables (LLM_API_KEY, LLM_API_BASE, LLM_MODEL)",
+            "tool_calls": None
+        }
+
+    # Создаём клиент OpenAI с кастомным base_url
+    client = openai.OpenAI(
+        api_key=LLM_API_KEY,
+        base_url=LLM_API_BASE,
+    )
+
+    try:
+        response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=messages,
             tools=tools,
             tool_choice="auto"
         )
-        return response.choices[0].message
-    """
-    # Заглушка для примера – замените на реальный код
-    raise NotImplementedError("Replace call_llm with actual LLM invocation")
+    except Exception as e:
+        # Если ошибка, возвращаем текст ошибки, чтобы агент мог продолжить
+        return {
+            "content": f"LLM call failed: {str(e)}",
+            "tool_calls": None
+        }
+
+    choice = response.choices[0]
+    tool_calls = []
+    if choice.message.tool_calls:
+        for tc in choice.message.tool_calls:
+            tool_calls.append({
+                "id": tc.id,
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments
+                }
+            })
+
+    return {
+        "content": choice.message.content,
+        "tool_calls": tool_calls
+    }
 
 # ---------- Основной цикл агента ----------
 def run_agent(user_query: str) -> Dict[str, Any]:
@@ -129,7 +190,7 @@ def run_agent(user_query: str) -> Dict[str, Any]:
         {"role": "user", "content": user_query}
     ]
     tool_calls_log = []
-    max_iterations = 20
+    max_iterations = 20  # увеличено для многошаговых задач
 
     for _ in range(max_iterations):
         response = call_llm(messages, TOOLS)
@@ -139,6 +200,7 @@ def run_agent(user_query: str) -> Dict[str, Any]:
             for tc in msg["tool_calls"]:
                 func_name = tc["function"]["name"]
                 args = json.loads(tc["function"]["arguments"])
+                # Выполняем соответствующий инструмент
                 if func_name == "read_file":
                     result = read_file(**args)
                 elif func_name == "list_files":
@@ -152,17 +214,20 @@ def run_agent(user_query: str) -> Dict[str, Any]:
                     "args": args,
                     "result": result
                 })
+                # Добавляем результат вызова в историю
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", f"call_{len(tool_calls_log)}"),
                     "content": result
                 })
         else:
+            # Нет вызовов инструментов — это финальный ответ
             final_answer = msg.get("content") or ""
             return {
                 "answer": final_answer,
                 "tool_calls": tool_calls_log
             }
+    # Если превышено число итераций
     return {
         "answer": "Agent stopped: too many iterations.",
         "tool_calls": tool_calls_log
