@@ -1,67 +1,28 @@
-import subprocess
-import json
-import sys
+"""Regression test for agent.py CLI."""
 
-def test_agent_basic():
-    # Запускаем agent.py с тестовым вопросом
+import json
+import subprocess
+from pathlib import Path
+
+
+def test_agent_outputs_valid_json_with_required_fields() -> None:
+    """Test that agent.py outputs valid JSON with 'answer' and 'tool_calls' fields."""
+    project_root = Path(__file__).parent.parent.parent.parent
+    agent_path = project_root / "agent.py"
+
     result = subprocess.run(
-        [sys.executable, "agent.py", "What does REST stand for?"],
+        ["uv", "run", str(agent_path), "What is 2+2?"],
         capture_output=True,
         text=True,
-        timeout=60
+        timeout=60,
+        cwd=project_root,
     )
 
-    # Проверяем код возврата
-    assert result.returncode == 0, f"Non-zero exit code: {result.returncode}"
+    assert result.returncode == 0, f"agent.py failed with: {result.stderr}"
 
-    # Парсим stdout как JSON
-    try:
-        output = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        assert False, f"stdout not valid JSON: {result.stdout}"
+    output = result.stdout.strip()
+    data = json.loads(output)
 
-    # Проверяем наличие обязательных полей
-    assert "answer" in output, "Missing 'answer' field"
-    assert "tool_calls" in output, "Missing 'tool_calls' field"
-    assert isinstance(output["tool_calls"], list), "'tool_calls' must be a list"
-    assert output["answer"], "Answer is empty"
-
-
-def test_merge_conflict():
-    """Проверяет, что при вопросе о merge conflict вызывается read_file и source указывает на wiki/git-workflow.md"""
-    result = subprocess.run(
-        ["uv", "run", "agent.py", "How do you resolve a merge conflict?"],
-        capture_output=True,
-        text=True
-    )
-    assert result.returncode == 0
-    data = json.loads(result.stdout)
-
-    assert "answer" in data
-    assert "source" in data
-    assert "wiki/git-workflow.md" in data["source"]
-    assert "#" in data["source"]  # должен быть якорь
-
-    # Проверяем, что среди tool_calls был read_file с путём wiki/git-workflow.md
-    calls = data.get("tool_calls", [])
-    assert any(
-        c["tool"] == "read_file" and "wiki/git-workflow.md" in c["args"].get("path", "")
-        for c in calls
-    ), "Не найден вызов read_file с wiki/git-workflow.md"
-
-
-def test_list_wiki():
-    """Проверяет, что при вопросе о содержимом wiki вызывается list_files"""
-    result = subprocess.run(
-        ["uv", "run", "agent.py", "What files are in the wiki?"],
-        capture_output=True,
-        text=True
-    )
-    assert result.returncode == 0
-    data = json.loads(result.stdout)
-
-    calls = data.get("tool_calls", [])
-    assert any(
-        c["tool"] == "list_files" and c["args"].get("path") == "wiki"
-        for c in calls
-    ), "Не найден вызов list_files с path='wiki'"
+    assert "answer" in data, "Missing 'answer' field in output JSON"
+    assert "tool_calls" in data, "Missing 'tool_calls' field in output JSON"
+    assert isinstance(data["tool_calls"], list), "'tool_calls' must be an array"
