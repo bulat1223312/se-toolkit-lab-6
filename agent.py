@@ -2,9 +2,10 @@
 import os
 import json
 import sys
+import traceback
 import requests
 import openai
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 # ---------- Переменные окружения ----------
 LLM_API_KEY = os.getenv("LLM_API_KEY")
@@ -13,15 +14,8 @@ LLM_MODEL = os.getenv("LLM_MODEL")
 LMS_API_KEY = os.getenv("LMS_API_KEY")
 AGENT_API_BASE_URL = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
 
-# Проверка наличия обязательных переменных для LLM (не fatal, но для отладки)
-if not all([LLM_API_KEY, LLM_API_BASE, LLM_MODEL]):
-    # Если нет ключей, выводим JSON с ошибкой и выходим
-    print(json.dumps({"error": "Missing LLM environment variables (LLM_API_KEY, LLM_API_BASE, LLM_MODEL)"}))
-    sys.exit(1)
-
 # ---------- Инструменты ----------
 def read_file(path: str) -> str:
-    """Читает содержимое файла. Путь относительно корня проекта."""
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return f.read()
@@ -29,7 +23,6 @@ def read_file(path: str) -> str:
         return f"Error reading file {path}: {e}"
 
 def list_files(path: str = ".") -> str:
-    """Возвращает список файлов в директории."""
     try:
         files = os.listdir(path)
         return "\n".join(files)
@@ -37,10 +30,6 @@ def list_files(path: str = ".") -> str:
         return f"Error listing files in {path}: {e}"
 
 def query_api(method: str, path: str, body: str = None, authenticate: bool = True) -> str:
-    """
-    Выполняет HTTP-запрос к бэкенду.
-    Возвращает JSON-строку с полями status_code и body.
-    """
     base_url = AGENT_API_BASE_URL
     url = base_url.rstrip('/') + '/' + path.lstrip('/')
     headers = {}
@@ -51,22 +40,22 @@ def query_api(method: str, path: str, body: str = None, authenticate: bool = Tru
     try:
         method = method.upper()
         if method == "GET":
-            resp = requests.get(url, headers=headers, timeout=10)
+            resp = requests.get(url, headers=headers)
         elif method == "POST":
             data = json.loads(body) if body else None
-            resp = requests.post(url, headers=headers, json=data, timeout=10)
+            resp = requests.post(url, headers=headers, json=data)
         elif method == "PUT":
             data = json.loads(body) if body else None
-            resp = requests.put(url, headers=headers, json=data, timeout=10)
+            resp = requests.put(url, headers=headers, json=data)
         elif method == "DELETE":
-            resp = requests.delete(url, headers=headers, timeout=10)
+            resp = requests.delete(url, headers=headers)
         else:
             return json.dumps({"status_code": 400, "body": "Unsupported method"})
         return json.dumps({"status_code": resp.status_code, "body": resp.text})
     except Exception as e:
         return json.dumps({"status_code": 500, "body": f"Request failed: {str(e)}"})
 
-# ---------- Схемы инструментов для LLM ----------
+# ---------- Схемы инструментов ----------
 TOOLS = [
     {
         "type": "function",
@@ -124,33 +113,25 @@ Available tools:
 - query_api: send HTTP requests to the backend API. Use this for questions about live data (item count, analytics) or to test API behaviour. By default it includes the backend API key; set authenticate=false to simulate unauthenticated requests.
 
 When answering:
-
-1. **Documentation questions** (wiki): use read_file on files under 'wiki/'.
-
-2. **Source code questions** (framework, routes): use read_file on relevant .py files. Start with main backend files like 'backend/main.py' or 'backend/app.py'. Look for imports to identify the framework.
-
-3. **Live data questions** (item counts, learners, scores): use query_api.
+1. Documentation questions (wiki): use read_file on files under 'wiki/'.
+2. Source code questions (framework, routes): use read_file on relevant .py files. Start with main backend files like 'backend/main.py' or 'backend/app.py'. Look for imports to identify the framework.
+3. Live data questions (item counts, learners, scores): use query_api.
    - For questions asking "how many" or a count, after calling the API, parse the response body (which is often a JSON array) and return the length of the array.
-   - Example: if the API returns [{"id":1}, {"id":2}], answer "2 items".
-
-4. **Debugging errors**: first use query_api to see the error, then read_file on the relevant source code to locate the bug.
+4. Debugging errors: first use query_api to see the error, then read_file on the relevant source code to locate the bug.
    - Look for common bug patterns: division by zero (operator `/`), operations on None, sorting without handling None (sorted(...) with None in list).
-   - When asked about risky operations in analytics.py, specifically search for `/` (division) and `sorted()` calls that might receive None.
-
-5. **Complex explanations** (e.g., request lifecycle): read all relevant files step by step (e.g., docker-compose.yml, Caddyfile, Dockerfile, main.py) and synthesize the information into a coherent answer.
-
-6. **Comparisons** (e.g., ETL vs API error handling): read the code for each part separately (etl.py and routers/), then describe the differences in their error handling strategies (e.g., try/except blocks, return codes, logging).
+5. Complex explanations (e.g., request lifecycle): read all relevant files step by step (e.g., docker-compose.yml, Caddyfile, Dockerfile, main.py) and synthesize the information.
+6. Comparisons (e.g., ETL vs API error handling): read the code for each part separately (etl.py and routers/), then describe the differences in their error handling strategies.
 
 Always output your reasoning step by step. When you need to use a tool, respond with a valid function call.
 """
 
-# ---------- Вызов LLM (OpenAI-совместимый, например Qwen) ----------
+# ---------- Реальный вызов LLM (OpenAI-совместимый, подходит для Qwen) ----------
 def call_llm(messages: List[Dict[str, str]], tools: List[Dict]) -> Dict[str, Any]:
-    """
-    Реальный вызов OpenAI-совместимого API (подходит для Qwen).
-    """
+    # Проверка наличия ключей (если нет, вернём ошибку)
+    if not all([LLM_API_KEY, LLM_API_BASE, LLM_MODEL]):
+        return {"content": "LLM configuration missing", "tool_calls": None}
     try:
-        # Настройка клиента (старый стиль openai<1.0.0, но многие ещё используют)
+        # Для openai <1.0.0 (старый стиль) – многие локальные сервера используют его
         openai.api_key = LLM_API_KEY
         openai.api_base = LLM_API_BASE
 
@@ -160,14 +141,9 @@ def call_llm(messages: List[Dict[str, str]], tools: List[Dict]) -> Dict[str, Any
             tools=tools,
             tool_choice="auto"
         )
-        # Возвращаем сообщение (содержит content и/или tool_calls)
         return response.choices[0].message
     except Exception as e:
-        # В случае ошибки возвращаем сообщение об ошибке, чтобы агент продолжил
-        return {
-            "content": f"LLM call failed: {str(e)}",
-            "tool_calls": None
-        }
+        return {"content": f"LLM call failed: {str(e)}", "tool_calls": None}
 
 # ---------- Основной цикл агента ----------
 def run_agent(user_query: str) -> Dict[str, Any]:
@@ -176,15 +152,13 @@ def run_agent(user_query: str) -> Dict[str, Any]:
         {"role": "user", "content": user_query}
     ]
     tool_calls_log = []
-    max_iterations = 20  # увеличено для сложных многошаговых задач
+    max_iterations = 20
 
     for _ in range(max_iterations):
         response = call_llm(messages, TOOLS)
-        # Извлекаем content (может быть None) и tool_calls
         content = response.get("content")
         tool_calls = response.get("tool_calls")
 
-        # Если есть вызовы инструментов – выполняем их
         if tool_calls:
             for tc in tool_calls:
                 func_name = tc["function"]["name"]
@@ -192,7 +166,7 @@ def run_agent(user_query: str) -> Dict[str, Any]:
                     args = json.loads(tc["function"]["arguments"])
                 except json.JSONDecodeError:
                     args = {}
-                # Выполняем соответствующий инструмент
+                # Выполнение инструмента
                 if func_name == "read_file":
                     result = read_file(**args)
                 elif func_name == "list_files":
@@ -206,37 +180,40 @@ def run_agent(user_query: str) -> Dict[str, Any]:
                     "args": args,
                     "result": result
                 })
-                # Добавляем результат вызова в историю
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", f"call_{len(tool_calls_log)}"),
                     "content": result
                 })
         else:
-            # Нет вызовов инструментов – это финальный ответ
             final_answer = content or ""
             return {
                 "answer": final_answer,
                 "tool_calls": tool_calls_log
             }
 
-    # Если превышено число итераций
     return {
         "answer": "Agent stopped: too many iterations.",
         "tool_calls": tool_calls_log
     }
 
 # ---------- Точка входа с гарантированным JSON-выводом ----------
-if __name__ == "__main__":
+def main():
     try:
         if len(sys.argv) < 2:
-            print(json.dumps({"error": "Usage: uv run agent.py 'your question'"}))
-            sys.exit(1)
-        question = sys.argv[1]
-        result = run_agent(question)
-        # Печатаем только JSON, без лишних логов
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+            result = {"error": "Usage: uv run agent.py 'your question'"}
+        else:
+            question = sys.argv[1]
+            result = run_agent(question)
     except Exception as e:
-        # Любое непредвиденное исключение перехватываем и выводим JSON с ошибкой
-        print(json.dumps({"error": f"Unhandled exception: {str(e)}"}))
-        sys.exit(1)
+        # Ловим всё, что могло пойти не так, и возвращаем JSON с ошибкой
+        result = {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+    # Гарантированный вывод JSON
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
